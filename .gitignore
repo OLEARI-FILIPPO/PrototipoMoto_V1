@@ -1,0 +1,30 @@
+# IDEs
+.vscode/
+.idea/
+*.iml
+*.iws
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Build directories
+build/
+bin/
+obj/
+out/
+
+# Flutter/Dart (also covered by inner .gitignore, but good to have)
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+/build/
