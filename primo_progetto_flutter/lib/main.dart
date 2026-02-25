@@ -3,6 +3,7 @@ import 'package:flutter_map_tile_caching/flutter_map_tile_caching.dart';
 import 'screens/new_map_screen.dart';
 import 'screens/network_view_screen.dart';
 import 'screens/region_selection_screen.dart';
+import 'screens/navigation_simulation.dart';
 
 Future<void> main() async {
   // Assicurati che i binding siano inizializzati
@@ -147,7 +148,31 @@ class HomePage extends StatelessWidget {
                   minimumSize: const Size(double.infinity, 60),
                 ),
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 16),
+
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const NavigationSimulationScreen(),
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.sports_motorsports, size: 28),
+                label: const Text(
+                  'Simulazione Navigazione',
+                  style: TextStyle(fontSize: 18),
+                ),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 32,
+                    vertical: 16,
+                  ),
+                  minimumSize: const Size(double.infinity, 60),
+                ),
+              ),
+              const SizedBox(height: 16),
 
               // Note informative
               Container(
