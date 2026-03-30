@@ -29,7 +29,7 @@
 #define LORA_DIO1  6
 
 // ---------------------------------------------------------------------------
-// PIN UWB – Cablaggio DWM3000 / DW1000 condivide SPI con LoRa
+// PIN UWB – Cablaggio DWM3000 (chip DW3000) condivide SPI con LoRa
 // ---------------------------------------------------------------------------
 #define UWB_CS     7
 #define UWB_RST    18
@@ -62,7 +62,7 @@ enum CommOverride {
 };
 
 // ---------------------------------------------------------------------------
-// Dati distanza da UWB (compilati dal modulo DW1000/DW3000 quando disponibile)
+// Dati distanza da UWB (aggiornati dal modulo DWM3000 / DW3000 quando disponibile)
 // ---------------------------------------------------------------------------
 struct UwbReading {
   float    distM   = 0.0f;   // distanza misurata (m)

@@ -63,7 +63,7 @@ Il file di configurazione centrale per la gestione radio riporta queste costanti
 #define LORA_RST   5
 #define LORA_DIO1  6
 
-// PIN UWB (DWM3000 / DW1000)
+// PIN UWB (DWM3000 – chip DW3000)
 #define UWB_CS     7
 #define UWB_RST    18
 #define UWB_IRQ    17

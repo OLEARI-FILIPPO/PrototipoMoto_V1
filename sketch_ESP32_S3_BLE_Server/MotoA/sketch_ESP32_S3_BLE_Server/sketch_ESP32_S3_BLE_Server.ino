@@ -6,11 +6,12 @@
 #include <Preferences.h>
 #include <SPI.h>
 
-// Imposta a 1 quando la libreria arduino-DW1000 è installata:
-// https://github.com/thotro/arduino-dw1000
-#define USE_UWB 0
+// Imposta a 1 quando la libreria DW3000 è installata:
+// https://github.com/Makerfabs/Makerfabs-ESP32-UWB
+// Installazione Arduino IDE: Sketch → Include Library → Add .ZIP Library
+#define USE_UWB 1
 #ifdef USE_UWB
-#include <DW1000Ranging.h>
+#include <dw3000.h>
 #endif
 
 #include <math.h>
@@ -22,49 +23,152 @@
 CommModeManager commManager;
 
 // =============================================================================
-// GESTIONE UWB (DW1000/DW3000)
+// GESTIONE UWB DW3000  (DS-TWR / SS-TWR  –  SPI condiviso con LoRa)
 // =============================================================================
 float currentUwbDist = -1.0f;
 unsigned long lastUwbReadingTime = 0;
 bool uwbInitialized = false;
 
+// ---- Timing DS-TWR (microsecondi; convertiti in tick DW3000 dove necessario) ----
+#define UWB_TX_ANT_DLY                  16385U  // Ritardo antenna TX (calibrare su banco)
+#define UWB_RX_ANT_DLY                  16385U  // Ritardo antenna RX
+#define UWB_POLL_RX_TO_RESP_TX_DLY_UUS   2000U  // Delay fisso risposta Anchor dopo Poll RX
+#define UWB_POLL_TX_TO_RESP_RX_DLY_UUS    500U  // Finestra RX Tag dopo Poll TX
+#define UWB_RESP_RX_TO_FINAL_TX_DLY_UUS   300U  // Delay TX Final dopo Reply RX (Tag)
+#define UWB_RESP_RX_TIMEOUT_UUS            600U  // Timeout RX Reply (Tag)
+#define UWB_FINAL_RX_TIMEOUT_UUS          2500U  // Timeout RX Final (Anchor)
+#define UWB_PRE_TIMEOUT                      5U  // Timeout rilevamento preambolo (PAC)
+#define UWB_UUS_TO_TICKS               63898ULL  // tick DW3000 per µs  (499.2 × 128 tick/µs)
+#define UWB_SPEED_OF_LIGHT          299702547.0  // m/s
+#define UWB_DWT_TS_UNIT   (1.0 / (499.2e6 * 128.0))  // secondi per tick DW3000
+
+// ---- Indici byte nei frame DS-TWR ----
+#define UWB_MSG_SN_IDX          2   // Sequence number nel frame
+#define UWB_MSG_COMMON_LEN     10   // Header comune per confronto tipo frame
+#define UWB_RESP_POLL_RX_IDX   10   // poll_rx_ts (4 B) nel Reply Anchor
+#define UWB_RESP_RESP_TX_IDX   14   // resp_tx_ts (4 B) nel Reply Anchor
+#define UWB_FINAL_POLL_TX_IDX  10   // poll_tx_ts (4 B) nel Final Tag
+#define UWB_FINAL_RESP_RX_IDX  14   // resp_rx_ts (4 B) nel Final Tag
+#define UWB_FINAL_FINAL_TX_IDX 18   // final_tx_ts (4 B) nel Final Tag
+#define UWB_TS_LEN              4   // Byte per campo timestamp nei messaggi
+
 #ifdef USE_UWB
-void cbUwbNewRange() {
-  currentUwbDist    = DW1000Ranging.getDistantDevice()->getRange();
-  lastUwbReadingTime = millis();
-  Serial.printf("[UWB-SUCCESS] Ranging valido! Distanza: %.2f m | Peer MAC: %04X | RX Power: %.1f dBm\n",
-                currentUwbDist,
-                DW1000Ranging.getDistantDevice()->getShortAddress(),
-                DW1000Ranging.getDistantDevice()->getRXPower());
+// ---- Configurazione canale DW3000 ----
+static dwt_config_t uwb_config = {
+  5,                       // Canale 5 (6.5 GHz)
+  DWT_PLEN_128,            // Preambolo 128 simboli
+  DWT_PAC8,                // PAC size 8
+  9,                       // Codice TX preambolo (canale 5)
+  9,                       // Codice RX preambolo
+  1,                       // SFD non standard Decawave
+  DWT_BR_6M8,              // Data rate 6.8 Mbps
+  DWT_PHRMODE_STD,         // PHY header standard
+  DWT_PHRRATE_STD,         // Rate PHY header standard
+  (128 + 1 + 8 - 8),       // Timeout SFD
+  DWT_STS_MODE_OFF,        // STS disabilitato
+  DWT_STS_LEN_64,          // Lunghezza STS (ignorata con STS_OFF)
+  DWT_PDOA_M0              // PDOA mode 0
+};
+
+// ---- Frame DS-TWR (IEEE 802.15.4 semplificati) ----
+// Poll : Tag → Anchor  (12 byte payload; DW3000 aggiunge 2 byte FCS automaticamente)
+static uint8_t uwb_tx_poll[]  = {0x41,0x88,0,0xCA,0xDE,'W','A','V','E',0xE0,0,0};
+// Reply: Anchor → Tag  (byte 10-13: poll_rx_ts; 14-17: resp_tx_ts)
+static uint8_t uwb_tx_reply[] = {0x41,0x88,0,0xCA,0xDE,'V','E','W','A',0xE1,0,0,0,0,0,0,0,0,0};
+// Final: Tag → Anchor  (byte 10-13: poll_tx_ts; 14-17: resp_rx_ts; 18-21: final_tx_ts)
+static uint8_t uwb_tx_final[] = {0x41,0x88,0,0xCA,0xDE,'W','A','V','E',0xE2,0,0,0,0,0,0,0,0,0,0,0,0,0};
+static uint8_t uwb_rx_buf[sizeof(uwb_tx_final)];
+static uint8_t uwb_frame_seq = 0;
+
+// ---- Helper: legge timestamp TX o RX a 40 bit come uint64_t ----
+static uint64_t uwb_get_tx_ts() {
+  uint8_t ts[5];
+  dwt_readtxtimestamp(ts);
+  uint64_t t = 0;
+  for (int i = 4; i >= 0; i--) { t <<= 8; t |= ts[i]; }
+  return t;
+}
+static uint64_t uwb_get_rx_ts() {
+  uint8_t ts[5];
+  dwt_readrxtimestamp(ts);
+  uint64_t t = 0;
+  for (int i = 4; i >= 0; i--) { t <<= 8; t |= ts[i]; }
+  return t;
 }
 
-void cbUwbNewDevice(DW1000Device* device) {
-  Serial.printf("[UWB-INFO] Nuovo dispositivo UWB connesso! MAC: %04X\n", device->getShortAddress());
+// ---- Helper: serializza/deserializza 32 bit (little-endian) nei messaggi ----
+static void uwb_put32(uint8_t *buf, uint32_t val) {
+  for (int i = 0; i < UWB_TS_LEN; i++) { buf[i] = (uint8_t)val; val >>= 8; }
 }
-
-void cbUwbInactiveDevice(DW1000Device* device) {
-  Serial.printf("[UWB-WARN] Dispositivo UWB disconnesso: %04X\n", device->getShortAddress());
-  currentUwbDist = -1.0f;
+static uint32_t uwb_get32(const uint8_t *buf) {
+  uint32_t v = 0;
+  for (int i = UWB_TS_LEN - 1; i >= 0; i--) { v <<= 8; v |= buf[i]; }
+  return v;
 }
 #endif // USE_UWB
 
 void initUWB() {
-  Serial.println("\n[UWB] Avvio inizializzazione modulo...");
+  Serial.println("\n[UWB] Avvio inizializzazione DW3000...");
 
-  // Disabilita LoRa dal bus SPI condiviso durante init UWB
+  // Mantieni LoRa disabilitato sul bus SPI condiviso durante l'init UWB
   pinMode(LORA_CS, OUTPUT);
   digitalWrite(LORA_CS, HIGH);
 
+  // Configura il bus SPI con i pin fisici condivisi LoRa + UWB
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
 
-  // Probe SPI: leggi DEV_ID del DW1000 prima di usare la libreria
+#ifdef USE_UWB
+  // Inizializza pin RST, IRQ e CS per il DW3000 tramite la libreria
+  spiBegin(UWB_IRQ, UWB_RST);
+  spiSelect(UWB_CS);
+  // Riconfigura il bus SPI con i nostri pin (spiSelect() usa internamente i pin
+  // default della board Makerfabs; questa chiamata ripristina il mapping corretto)
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+
+  delay(2);  // Breve pausa per stabilizzazione oscillatore
+
+  // Attendi stato IDLE RC prima di procedere
+  uint32_t t0 = millis();
+  while (!dwt_checkidlerc()) {
+    if (millis() - t0 > 500) {
+      Serial.println("[UWB] ERRORE: DW3000 non raggiunge IDLE. Verificare alimentazione e cablaggio SPI.");
+      return;
+    }
+    delay(5);
+  }
+
+  if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+    Serial.println("[UWB] ERRORE: inizializzazione DW3000 fallita. Controllare SCK/MISO/MOSI/CS.");
+    return;
+  }
+
+  if (dwt_configure(&uwb_config)) {
+    Serial.println("[UWB] ERRORE: configurazione canale DW3000 fallita.");
+    return;
+  }
+
+  dwt_setrxantennadelay(UWB_RX_ANT_DLY);
+  dwt_settxantennadelay(UWB_TX_ANT_DLY);
+
+  Serial.printf("[UWB] DW3000 DEV_ID = 0x%08X\n", (unsigned int)dwt_readdevid());
+  Serial.printf("[UWB] Pin: CS=%d  RST=%d  IRQ=%d  SCK=%d  MISO=%d  MOSI=%d\n",
+                UWB_CS, UWB_RST, UWB_IRQ, LORA_SCK, LORA_MISO, LORA_MOSI);
+  Serial.printf("[UWB] Ruolo: %s\n",
+                String(DEVICE_ID) == "A"
+                  ? "ANCHOR (Responder DS-TWR)"
+                  : "TAG (Initiator SS/DS-TWR)");
+  Serial.println("[UWB] DW3000 inizializzato con successo.");
+  uwbInitialized = true;
+
+#else
+  // USE_UWB=0: probe SPI per verificare la presenza fisica del modulo
   {
     pinMode(UWB_CS, OUTPUT);
     digitalWrite(UWB_CS, HIGH);
     delay(5);
     SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
     digitalWrite(UWB_CS, LOW);
-    SPI.transfer(0x00);
+    SPI.transfer(0x00);               // comando: leggi registro 0 (DEV_ID)
     uint8_t b0 = SPI.transfer(0x00);
     uint8_t b1 = SPI.transfer(0x00);
     uint8_t b2 = SPI.transfer(0x00);
@@ -73,54 +177,218 @@ void initUWB() {
     SPI.endTransaction();
     uint32_t devId = ((uint32_t)b3 << 24) | ((uint32_t)b2 << 16) |
                      ((uint32_t)b1 << 8)  |  (uint32_t)b0;
-    Serial.printf("[UWB]  DEV_ID raw = 0x%08X\n", devId);
+    Serial.printf("[UWB] DEV_ID raw = 0x%08X\n", devId);
     bool present = ((devId >> 16) == 0xDECA) && (devId != 0xFFFFFFFF) && (devId != 0x00000000);
-    if (present) {
-      Serial.println("[UWB]  Modulo UWB rilevato via SPI! (DEV_ID valido)");
-    } else {
-      Serial.println("[UWB]  Modulo UWB NON risponde su SPI. Init saltato. Fallback: LoRa.");
-      return;
-    }
+    Serial.println(present
+      ? "[UWB] Modulo DW3000 rilevato su SPI (DEV_ID valido). Installare libreria e ricompilare con USE_UWB=1."
+      : "[UWB] Modulo DW3000 NON risponde su SPI. Verificare cablaggio.");
   }
-
-#ifdef USE_UWB
-  DW1000Ranging.initCommunication(UWB_RST, UWB_CS, UWB_IRQ);
-
-  // MAC univoco per device per evitare collisioni
-  String macStr = "DE:AD:BE:EF:00:0";
-  macStr += String(DEVICE_ID);
-
-  DW1000Ranging.attachNewRange(cbUwbNewRange);
-  DW1000Ranging.attachNewDevice(cbUwbNewDevice);
-  DW1000Ranging.attachInactiveDevice(cbUwbInactiveDevice);
-
-  Serial.println("[UWB] Configurazione SPI e pin completata.");
-  Serial.printf("[UWB] Indirizzo MAC assegnato: %s\n", macStr.c_str());
-
-  // MotoA = Anchor (punto fisso di riferimento), B e C = Tag (nodi mobili)
-  if (String(DEVICE_ID) == "A") {
-    DW1000Ranging.startAsAnchor((char *)macStr.c_str(), DW1000.MODE_LONGDATA_RANGE_ACCURACY);
-    Serial.println("[UWB] Modulo configurato come ANCHOR (nodo fisso di riferimento).");
-    Serial.println("[UWB] In attesa dei TAG (MotoB, MotoC)...");
-  } else {
-    DW1000Ranging.startAsTag((char *)macStr.c_str(), DW1000.MODE_LONGDATA_RANGE_ACCURACY);
-    Serial.println("[UWB] Modulo configurato come TAG (nodo in movimento).");
-    Serial.println("[UWB] In ricerca dell Anchor (MotoA)...");
-  }
-
-  uwbInitialized = true;
-#else
-  Serial.println("[UWB] Modulo UWB disabilitato a compile-time (USE_UWB=0).");
+  Serial.println("[UWB] UWB disabilitato a compile-time (USE_UWB=0).");
 #endif // USE_UWB
 }
 
 float readUwbDistanceMeters() {
   if (!uwbInitialized) return -1.0f;
+
 #ifdef USE_UWB
-  DW1000Ranging.loop();
-#endif
+  uint32_t status;
+  const bool isAnchor = (String(DEVICE_ID) == "A");
+
+  if (isAnchor) {
+    // =========================================================================
+    // ANCHOR (Responder):
+    //   1) Attende Poll dal Tag
+    //   2) Invia Reply con timestamps embedded (T2, T3)
+    //   3) Attende Final dal Tag
+    //   4) Calcola distanza DS-TWR dai 6 timestamp totali
+    // =========================================================================
+    dwt_setrxtimeout(0);
+    dwt_setpreambledetecttimeout(0);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    uint32_t tstart = millis();
+    while (!((status = dwt_read32bitreg(SYS_STATUS_ID)) &
+             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {
+      if (millis() - tstart > 200) {
+        dwt_forcetrxoff();
+        return currentUwbDist;   // Nessun Poll ricevuto entro 200 ms
+      }
+    }
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+      return currentUwbDist;
+    }
+
+    // Leggi il frame ricevuto
+    uint32_t flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+    if (flen <= sizeof(uwb_rx_buf)) dwt_readrxdata(uwb_rx_buf, flen, 0);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+
+    // Verifica tipo frame: deve essere un Poll
+    uwb_rx_buf[UWB_MSG_SN_IDX] = 0;
+    if (memcmp(uwb_rx_buf, uwb_tx_poll, UWB_MSG_COMMON_LEN) != 0) return currentUwbDist;
+
+    // T2 = timestamp ricezione Poll (40 bit)
+    uint64_t poll_rx_ts = uwb_get_rx_ts();
+
+    // Calcola T3 = tempo schedulato TX Reply (arrotondato a multiplo di 2 per PLL)
+    uint32_t resp_tx_time = (uint32_t)((poll_rx_ts +
+      (uint64_t)UWB_POLL_RX_TO_RESP_TX_DLY_UUS * UWB_UUS_TO_TICKS) >> 8);
+    resp_tx_time &= 0xFFFFFFFEUL;
+    // Timestamp atteso della trasmissione Reply (include ritardo antenna TX)
+    uint32_t resp_tx_ts_32 = (uint32_t)(((uint64_t)resp_tx_time << 8) + UWB_TX_ANT_DLY);
+
+    // Componi Reply con T2 e T3 embedded
+    uwb_tx_reply[UWB_MSG_SN_IDX] = uwb_frame_seq;
+    uwb_put32(uwb_tx_reply + UWB_RESP_POLL_RX_IDX, (uint32_t)(poll_rx_ts & 0xFFFFFFFF));
+    uwb_put32(uwb_tx_reply + UWB_RESP_RESP_TX_IDX, resp_tx_ts_32);
+
+    // Programma TX differito e abilita RX automatico per il Final successivo
+    dwt_setdelayedtrxtime(resp_tx_time);
+    dwt_setrxaftertxdelay(UWB_RESP_RX_TO_FINAL_TX_DLY_UUS);
+    dwt_setrxtimeout(UWB_FINAL_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(UWB_PRE_TIMEOUT);
+    dwt_writetxdata(sizeof(uwb_tx_reply), uwb_tx_reply, 0);
+    dwt_writetxfctrl(sizeof(uwb_tx_reply) + 2, 0, 1);  // +2 FCS; ranging=1
+    if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+      Serial.println("[UWB] ANCHOR: TX Reply in ritardo. Aumentare UWB_POLL_RX_TO_RESP_TX_DLY_UUS.");
+      return currentUwbDist;
+    }
+
+    // Attendi Final dal Tag
+    tstart = millis();
+    while (!((status = dwt_read32bitreg(SYS_STATUS_ID)) &
+             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {
+      if (millis() - tstart > 400) {
+        dwt_forcetrxoff();
+        return currentUwbDist;
+      }
+    }
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+      return currentUwbDist;
+    }
+
+    flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+    if (flen <= sizeof(uwb_rx_buf)) dwt_readrxdata(uwb_rx_buf, flen, 0);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+
+    uwb_rx_buf[UWB_MSG_SN_IDX] = 0;
+    if (memcmp(uwb_rx_buf, uwb_tx_final, UWB_MSG_COMMON_LEN) != 0) return currentUwbDist;
+
+    // T6 = timestamp ricezione Final
+    uint64_t final_rx_ts = uwb_get_rx_ts();
+
+    // Leggi T1, T4, T5 dal messaggio Final
+    uint32_t poll_tx_ts_32  = uwb_get32(uwb_rx_buf + UWB_FINAL_POLL_TX_IDX);
+    uint32_t resp_rx_ts_32  = uwb_get32(uwb_rx_buf + UWB_FINAL_RESP_RX_IDX);
+    uint32_t final_tx_ts_32 = uwb_get32(uwb_rx_buf + UWB_FINAL_FINAL_TX_IDX);
+
+    // Calcolo distanza DS-TWR (tutti e sei i timestamp, aritmetica a 32 bit con wrap)
+    // Ra = T4 - T1  (Round-trip 1 lato Tag)
+    // Da = T3 - T2  (Turnaround Anchor)
+    // Rb = T6 - T3  (Round-trip 2 lato Anchor)
+    // Db = T5 - T4  (Turnaround Tag)
+    // ToF = (Ra·Rb − Da·Db) / (Ra + Rb + Da + Db)
+    double Ra = (double)((resp_rx_ts_32                              - poll_tx_ts_32 ) & 0xFFFFFFFFUL);
+    double Da = (double)((resp_tx_ts_32 - (uint32_t)(poll_rx_ts & 0xFFFFFFFF)       ) & 0xFFFFFFFFUL);
+    double Rb = (double)(((uint32_t)(final_rx_ts & 0xFFFFFFFF)      - resp_tx_ts_32 ) & 0xFFFFFFFFUL);
+    double Db = (double)((final_tx_ts_32                             - resp_rx_ts_32 ) & 0xFFFFFFFFUL);
+
+    double tof  = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db);
+    float  dist = (float)(tof * UWB_DWT_TS_UNIT * UWB_SPEED_OF_LIGHT);
+    if (dist > 0.0f && dist < 300.0f) {
+      currentUwbDist     = dist;
+      lastUwbReadingTime = millis();
+      Serial.printf("[UWB] ANCHOR distanza = %.2f m (DS-TWR)\n", dist);
+    }
+    uwb_frame_seq++;
+
+  } else {
+    // =========================================================================
+    // TAG (Initiator):
+    //   1) Invia Poll
+    //   2) Riceve Reply con T2 e T3 embedded (da Anchor)
+    //   3) Invia Final con T1, T4, T5 (per DS-TWR lato Anchor)
+    //   4) Calcola distanza SS-TWR localmente dai timestamp embedded nel Reply
+    // =========================================================================
+    uwb_tx_poll[UWB_MSG_SN_IDX] = uwb_frame_seq;
+    dwt_writetxdata(sizeof(uwb_tx_poll), uwb_tx_poll, 0);
+    dwt_writetxfctrl(sizeof(uwb_tx_poll) + 2, 0, 1);   // +2 FCS; ranging=1
+    dwt_setrxaftertxdelay(UWB_POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(UWB_RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(UWB_PRE_TIMEOUT);
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+
+    // Attendi Reply dall'Anchor
+    uint32_t tstart = millis();
+    while (!((status = dwt_read32bitreg(SYS_STATUS_ID)) &
+             (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {
+      if (millis() - tstart > 150) {
+        dwt_forcetrxoff();
+        return currentUwbDist;
+      }
+    }
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+      dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+      return currentUwbDist;   // Timeout o errore RX: Anchor non trovato
+    }
+
+    // T1 = timestamp trasmissione Poll (lettura dopo TX, quando RX è arrivato)
+    uint64_t poll_tx_ts = uwb_get_tx_ts();
+    // T4 = timestamp ricezione Reply
+    uint64_t resp_rx_ts = uwb_get_rx_ts();
+
+    // Leggi frame Reply
+    uint32_t flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+    if (flen <= sizeof(uwb_rx_buf)) dwt_readrxdata(uwb_rx_buf, flen, 0);
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+
+    uwb_rx_buf[UWB_MSG_SN_IDX] = 0;
+    if (memcmp(uwb_rx_buf, uwb_tx_reply, UWB_MSG_COMMON_LEN) != 0) return currentUwbDist;
+
+    // Estrai T2 e T3 embedded nel Reply (inviati dall'Anchor)
+    uint32_t poll_rx_ts_32 = uwb_get32(uwb_rx_buf + UWB_RESP_POLL_RX_IDX);
+    uint32_t resp_tx_ts_32 = uwb_get32(uwb_rx_buf + UWB_RESP_RESP_TX_IDX);
+
+    // Calcola T5 = tempo schedulato TX Final
+    uint32_t final_tx_time = (uint32_t)((resp_rx_ts +
+      (uint64_t)UWB_RESP_RX_TO_FINAL_TX_DLY_UUS * UWB_UUS_TO_TICKS) >> 8);
+    final_tx_time &= 0xFFFFFFFEUL;
+    uint32_t final_tx_ts_32 = (uint32_t)(((uint64_t)final_tx_time << 8) + UWB_TX_ANT_DLY);
+
+    // Componi Final con T1, T4, T5
+    uwb_tx_final[UWB_MSG_SN_IDX] = uwb_frame_seq;
+    uwb_put32(uwb_tx_final + UWB_FINAL_POLL_TX_IDX,  (uint32_t)(poll_tx_ts & 0xFFFFFFFF));
+    uwb_put32(uwb_tx_final + UWB_FINAL_RESP_RX_IDX,  (uint32_t)(resp_rx_ts & 0xFFFFFFFF));
+    uwb_put32(uwb_tx_final + UWB_FINAL_FINAL_TX_IDX, final_tx_ts_32);
+
+    dwt_setdelayedtrxtime(final_tx_time);
+    dwt_writetxdata(sizeof(uwb_tx_final), uwb_tx_final, 0);
+    dwt_writetxfctrl(sizeof(uwb_tx_final) + 2, 0, 1);
+    dwt_starttx(DWT_START_TX_DELAYED);
+
+    // Calcolo distanza SS-TWR lato Tag (usando T2 e T3 dell'Anchor dal Reply)
+    // Ra = T4 - T1  (Round-trip Poll→Reply al Tag)
+    // Da = T3 - T2  (Turnaround Anchor: tempo tra ricezione Poll e TX Reply)
+    // ToF = (Ra - Da) / 2
+    double Ra = (double)(((uint32_t)(resp_rx_ts & 0xFFFFFFFF) -
+                           (uint32_t)(poll_tx_ts & 0xFFFFFFFF)) & 0xFFFFFFFFUL);
+    double Da = (double)((resp_tx_ts_32 - poll_rx_ts_32) & 0xFFFFFFFFUL);
+    double tof  = (Ra - Da) / 2.0;
+    float  dist = (float)(tof * UWB_DWT_TS_UNIT * UWB_SPEED_OF_LIGHT);
+    if (dist > 0.0f && dist < 300.0f) {
+      currentUwbDist     = dist;
+      lastUwbReadingTime = millis();
+      Serial.printf("[UWB] TAG distanza = %.2f m (SS-TWR)\n", dist);
+    }
+    uwb_frame_seq++;
+  }
+#endif // USE_UWB
+
+  // Invalida la distanza se nessun dato recente dal DW3000
   if (millis() - lastUwbReadingTime > 3000 && currentUwbDist >= 0.0f) {
-    Serial.println("[UWB-ERROR] Nessun dato recente dal modulo UWB (Timeout 3s). Verificare connessione.");
+    Serial.println("[UWB] Timeout: nessun dato recente dal DW3000.");
     currentUwbDist = -1.0f;
   }
   return currentUwbDist;
