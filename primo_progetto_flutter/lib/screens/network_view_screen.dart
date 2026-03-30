@@ -21,6 +21,8 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
   DeviceNodeState _localDeviceState = DeviceNodeState.idle;
   DeviceConnectionInfo _connection = const DeviceConnectionInfo.empty();
   Timer? _modeTimer;
+  String _activeCommMode = "Sconosciuto";
+  String _commOverride = 'AUTO'; // 'AUTO' | 'UWB' | 'LoRa'
 
   @override
   void initState() {
@@ -54,149 +56,68 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
   void _parseAndUpdateNodes(List<int> payload) {
     final message = String.fromCharCodes(payload);
 
-    // Simple JSON parsing logic
     try {
-      debugPrint('═══════════════════════════════════════');
-      debugPrint('[MESH PARSER] 📥 RAW MESSAGE: $message');
-      
-      // Extract source
-      final srcMatch = RegExp(r'"src":"([^"]+)"').firstMatch(message);
-      final source = srcMatch?.group(1) ?? 'UNKNOWN';
-      debugPrint('[MESH PARSER] 📍 Source ESP32: $source');
-
-      final peersMatch = RegExp(r'"peers":\s*\[([^\]]*)\]').firstMatch(message);
-      if (peersMatch == null) {
-        debugPrint('[MESH PARSER] ⚠️ No peers array found in message');
-        debugPrint('[MESH PARSER] 🔍 Current nodes in memory: ${_nodes.length}');
-        return;
+      // --- Comm mode (solo quando cambia) ---
+      final commMatch = RegExp(r'"comm":"([^"]+)"').firstMatch(message);
+      final comm = commMatch?.group(1) ?? 'UNKNOWN';
+      if (comm != 'UNKNOWN' && _activeCommMode != comm) {
+        setState(() { _activeCommMode = comm; });
+        debugPrint('[COMM] Modalità → $comm');
       }
+
+      // --- Peers ---
+      final peersMatch = RegExp(r'"peers":\s*\[([^\]]*)\]').firstMatch(message);
+      if (peersMatch == null) return;
 
       final peersArrayStr = peersMatch.group(1)!;
       if (peersArrayStr.trim().isEmpty) {
-        debugPrint(
-          '[MESH PARSER] ⚠️ EMPTY PEERS from $source! ESP32-$source is NOT seeing any other devices',
-        );
-        debugPrint(
-          '[MESH PARSER] 💡 Possible reasons: 1) ESP32 in IDLE state 2) No other ESP32 in PAIRING/SEARCHING 3) Distance too far',
-        );
-        // NON ritornare qui! Continua ad aggiornare lo stato UI
-        // Questo permette di mantenere i nodi visibili anche quando
-        // l'ESP32 temporaneamente non rileva peers (es. dopo timeout CONNECTED)
-
-        // Se abbiamo già nodi, mantienili visibili senza aggiornarli
-        if (_nodes.isNotEmpty) {
-          setState(() {
-            debugPrint(
-              '[MESH PARSER] 💾 Keeping ${_nodes.length} existing node(s) visible despite empty peers',
-            );
-            for (var node in _nodes) {
-              debugPrint('[MESH PARSER]    └─ ${node.id} (RSSI: ${node.rssi}, Dist: ${node.distance?.toStringAsFixed(2) ?? "N/A"}m)');
-            }
-          });
-        } else {
-          debugPrint('[MESH PARSER] ❌ No nodes in memory and no peers received - network is empty');
-        }
+        // Nessun peer: teniamo i nodi esistenti visibili, nessun log
         return;
       }
 
       final peerObjects = RegExp(r'\{[^\}]+\}').allMatches(peersArrayStr);
-      debugPrint(
-        '[MESH PARSER] ✅ Found ${peerObjects.length} peer(s) in message from $source',
-      );
+      final int prevCount = _nodes.length;
 
       setState(() {
-        int updatedCount = 0;
-        int newCount = 0;
-        int skippedCount = 0;
-
         for (final peerMatch in peerObjects) {
           final peerStr = peerMatch.group(0)!;
           final idMatch = RegExp(r'"id":"([^"]+)"').firstMatch(peerStr);
+          if (idMatch == null) continue;
+
+          final peerId = idMatch.group(1)!;
+          if (peerId.toLowerCase() == 'unknown') continue;
+
           final rssiMatch = RegExp(r'"rssi":(-?\d+)').firstMatch(peerStr);
           final distMatch = RegExp(r'"dist":([0-9.]+)').firstMatch(peerStr);
+          final rssi = rssiMatch != null ? int.parse(rssiMatch.group(1)!) : 0;
+          final dist = distMatch != null ? double.parse(distMatch.group(1)!) : null;
 
-          if (idMatch != null) {
-            final peerId = idMatch.group(1)!;
-            if (peerId.toLowerCase() == 'unknown') {
-              debugPrint('[MESH PARSER] ⏭️ Skipping "unknown" peer');
-              skippedCount++;
-              continue;
-            }
+          final newNode = NetworkNode(
+            id: peerId,
+            name: peerId,
+            state: DeviceNodeState.unknown,
+            distance: dist,
+            rssi: rssi,
+            lastSeen: DateTime.now(),
+            isLocalDevice: false,
+          );
 
-            final rssi = rssiMatch != null ? int.parse(rssiMatch.group(1)!) : 0;
-            final dist = distMatch != null
-                ? double.parse(distMatch.group(1)!)
-                : null;
-
-            final existingIndex = _nodes.indexWhere((n) => n.id == peerId);
-
-            // Check for indirect/direct reporting
-            String reportType = "DIRECT";
-            if (peerId.toLowerCase().contains('indirect')) {
-              reportType = "INDIRECT (via another ESP32)";
-            }
-
-            debugPrint(
-              '[MESH PARSER] 📡 Peer: $peerId | Type: $reportType | RSSI: $rssi dBm | Distance: ${dist?.toStringAsFixed(2) ?? "N/A"}m | ${existingIndex >= 0 ? "🔄 UPDATING" : "🆕 NEW"}',
-            );
-
-            final newNode = NetworkNode(
-              id: peerId,
-              name: peerId,
-              state: DeviceNodeState.unknown,
-              distance: dist,
-              rssi: rssi,
-              lastSeen: DateTime.now(),
-              isLocalDevice: false,
-            );
-
-            if (existingIndex >= 0) {
-              // Log old vs new values for debugging
-              final oldNode = _nodes[existingIndex];
-              debugPrint(
-                '[MESH PARSER] 🔄 Updating node $peerId: RSSI ${oldNode.rssi} → $rssi, Dist ${oldNode.distance?.toStringAsFixed(2) ?? "N/A"} → ${dist?.toStringAsFixed(2) ?? "N/A"}m',
-              );
-              _nodes[existingIndex] = newNode;
-              updatedCount++;
-            } else {
-              _nodes.add(newNode);
-              newCount++;
-            }
+          final existingIndex = _nodes.indexWhere((n) => n.id == peerId);
+          if (existingIndex >= 0) {
+            _nodes[existingIndex] = newNode;
+          } else {
+            _nodes.add(newNode);
+            debugPrint('[PEERS] ➕ Nuovo nodo: $peerId | RSSI $rssi | ${dist?.toStringAsFixed(1) ?? "--"}m');
           }
         }
 
-        debugPrint(
-          '[MESH PARSER] ✅ SUMMARY: Updated: $updatedCount | New: $newCount | Skipped: $skippedCount | Total nodes: ${_nodes.length}',
-        );
-
-        if (_nodes.isNotEmpty) {
-          debugPrint('[MESH PARSER] 📊 Current network topology:');
-          for (var node in _nodes) {
-            final indirectMarker = node.id.toLowerCase().contains('indirect') ? '↪️ ' : '→ ';
-            debugPrint('[MESH PARSER]    $indirectMarker ${node.id} (RSSI: ${node.rssi}, Dist: ${node.distance?.toStringAsFixed(2) ?? "N/A"}m)');
-          }
+        // Log solo quando il numero di nodi cambia
+        if (_nodes.length != prevCount) {
+          debugPrint('[PEERS] Totale nodi: $prevCount → ${_nodes.length}');
         }
-
-        debugPrint(
-          '[MESH PARSER] 🎨 Calling setState() to refresh UI with ${_nodes.length} node(s)',
-        );
-
-        // ✨ NON RIMUOVERE I NODI!
-        // Dopo il pairing, i nodi rimangono visibili fino a disconnessione esplicita
-        // Questo permette di visualizzare la mesh persistente anche dopo il timeout di 30s
-        // I nodi verranno rimossi solo quando:
-        // 1. L'utente preme STOP MODE
-        // 2. Si disconnette dall'ESP32 Bridge
-        // 3. L'app viene chiusa
-
-        debugPrint(
-          '[MESH PARSER] 💾 Persistent mesh: keeping all ${_nodes.length} discovered node(s)',
-        );
-        debugPrint('═══════════════════════════════════════');
       });
     } catch (e) {
-      debugPrint('[MESH PARSER] ❌ Error parsing telemetry: $e');
-      debugPrint('═══════════════════════════════════════');
+      debugPrint('[PARSER] ❌ Errore: $e');
     }
   }
 
@@ -275,6 +196,7 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
                 ),
         ),
         _buildControls(),
+        _buildCommControls(),
       ],
     );
   }
@@ -285,25 +207,65 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
       color: Colors.grey[900],
       padding: const EdgeInsets.all(16),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Icon(Icons.bluetooth_connected, color: Colors.green),
-          const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          Row(
             children: [
-              Text(
-                device?.platformName ?? "Unknown",
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 16,
-                ),
-              ),
-              Text(
-                device?.remoteId.str ?? "",
-                style: const TextStyle(color: Colors.grey, fontSize: 12),
+              const Icon(Icons.bluetooth_connected, color: Colors.green),
+              const SizedBox(width: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    device?.platformName ?? "Unknown",
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                  Text(
+                    device?.remoteId.str ?? "",
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                ],
               ),
             ],
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: _activeCommMode.startsWith("UWB")
+                  ? Colors.blueAccent
+                  : _activeCommMode.startsWith("LoRa")
+                      ? Colors.orangeAccent
+                      : Colors.grey,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  _activeCommMode.contains("[F]")
+                      ? Icons.lock
+                      : _activeCommMode.startsWith("UWB")
+                          ? Icons.wifi_tethering
+                          : _activeCommMode.startsWith("LoRa")
+                              ? Icons.cell_tower
+                              : Icons.help_outline,
+                  color: Colors.white,
+                  size: 16,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  _activeCommMode,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -487,6 +449,45 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
     );
   }
 
+  Widget _buildCommControls() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: const Color(0xFF1A1A1A),
+      child: Row(
+        children: [
+          const Text(
+            "Comm:",
+            style: TextStyle(color: Colors.white70, fontSize: 13),
+          ),
+          const SizedBox(width: 8),
+          _buildCommButton("UWB", Colors.blueAccent),
+          const SizedBox(width: 6),
+          _buildCommButton("LoRa", Colors.orangeAccent),
+          const SizedBox(width: 6),
+          _buildCommButton("AUTO", Colors.green),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCommButton(String mode, Color color) {
+    final isActive = _commOverride == mode;
+    return ElevatedButton(
+      onPressed: () async {
+        await _service.setCommMode(mode);
+        setState(() => _commOverride = mode);
+      },
+      style: ElevatedButton.styleFrom(
+        backgroundColor: isActive ? color : color.withOpacity(0.3),
+        foregroundColor: Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        minimumSize: const Size(0, 32),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: Text(mode, style: const TextStyle(fontSize: 12)),
+    );
+  }
+
   Widget _buildModeButton(String label, DeviceNodeState mode, Color color) {
     final isActive = _localDeviceState == mode;
     return ElevatedButton(
@@ -508,11 +509,10 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
       } else if (mode == DeviceNodeState.searching) {
         await _service.startSearchingMode();
       } else {
-        // Quando si ferma la modalità, pulisci i nodi della mesh
         await _service.stopMode();
         setState(() {
           _nodes.clear();
-          debugPrint('[MESH] 🗑️ Cleared all nodes on STOP MODE');
+          _commOverride = 'AUTO';
         });
       }
 
@@ -522,11 +522,8 @@ class _NetworkViewScreenState extends State<NetworkViewScreen> {
         // Auto-transition to CONNECTED after 30s if nodes found
         _modeTimer = Timer(const Duration(seconds: 30), () {
           if (mounted) {
-            // Don't send STOPMODE! Just update UI to show CONNECTED
-            // The ESP32 will automatically transition to CONNECTED when timeout expires
             setState(() {
               _localDeviceState = DeviceNodeState.connected;
-              debugPrint('[MESH] ⏱️ Timer expired - transitioning to CONNECTED, keeping nodes visible');
             });
           }
         });

@@ -1,5 +1,9 @@
 # Moto BLE firmware (A/B/C/…)
 
+Documentazione collegata:
+
+- `PINOUT_MOTO_FIRMWARE.md` — riepilogo dei pin usati dal firmware e loro funzione
+
 Questi sketch sono pensati per essere **tutti identici** per MotoA, MotoB, MotoC…
 L'unica cosa che cambia è:
 

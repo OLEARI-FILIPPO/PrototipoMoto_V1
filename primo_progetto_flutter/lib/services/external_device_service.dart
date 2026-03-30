@@ -136,13 +136,6 @@ class ExternalDeviceService {
         connection.telemetrySubscription = telemetryCharacteristic
             .onValueReceived
             .listen((payload) {
-              // Log raw telemetry data
-              final rawDataStr = payload.map((b) => b.toString().padLeft(3, ' ')).join(', ');
-              final asciiStr = String.fromCharCodes(payload.where((b) => b >= 32 && b <= 126));
-              debugPrint('═══════════════════════════════════════');
-              debugPrint('[MESH TELEMETRY] Raw bytes: [$rawDataStr]');
-              debugPrint('[MESH TELEMETRY] ASCII: $asciiStr');
-              
               _telemetryController.add(
                 DeviceTelemetryMessage(
                   payload: List<int>.from(payload),
@@ -183,6 +176,12 @@ class ExternalDeviceService {
 
   Future<void> stopMode() async {
     await _sendCommand('STOPMODE');
+  }
+
+  /// Forza la modalità di comunicazione: 'UWB', 'LoRa', o 'AUTO'
+  Future<void> setCommMode(String mode) async {
+    // mode: 'UWB' | 'LoRa' | 'AUTO'
+    await _sendCommand('COMM_$mode');
   }
 
   Future<void> _sendCommand(String cmd) async {
