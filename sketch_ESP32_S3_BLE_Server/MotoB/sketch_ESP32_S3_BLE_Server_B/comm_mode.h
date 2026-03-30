@@ -29,11 +29,64 @@
 #define LORA_DIO1  6
 
 // ---------------------------------------------------------------------------
-// PIN UWB – Cablaggio DWM3000 / DW1000 condivide SPI con LoRa
+// PIN UWB – MaUWB DW3000 con STM32 AT Command (comunicazione UART2)
+// Il modulo STM32 gestisce SPI con DW3000; ESP32 comunica via AT commands.
+// Riferimento: https://github.com/Makerfabs/MaUWB_ESP32S3-with-STM32-AT-Command
 // ---------------------------------------------------------------------------
-#define UWB_CS     7
-#define UWB_RST    18
-#define UWB_IRQ    17
+#define UWB_RXD    18   // GPIO18 = UART2 RX (ESP32 riceve da STM32)
+#define UWB_TXD    17   // GPIO17 = UART2 TX (ESP32 trasmette a STM32)
+#define UWB_RESET  16   // GPIO16 = Reset hardware modulo UWB (STM32)
+
+// UART2 dedicato alla comunicazione AT con il modulo UWB
+static HardwareSerial uwbSerial(2);
+
+// ---------------------------------------------------------------------------
+// Invia un comando AT al modulo UWB e attende la risposta per 'timeout' ms.
+// ---------------------------------------------------------------------------
+static String uwbSendAT(const String& cmd, uint32_t timeout = 2000) {
+  uwbSerial.println(cmd);
+  String resp;
+  resp.reserve(256);
+  uint32_t start = millis();
+  while (millis() - start < timeout) {
+    while (uwbSerial.available()) {
+      char c = uwbSerial.read();
+      resp += c;
+    }
+    delay(1);  // cedi CPU ad altri task
+  }
+  Serial.printf("[UWB-AT] >> %s\n[UWB-AT] << %s\n", cmd.c_str(), resp.c_str());
+  return resp;
+}
+
+// ---------------------------------------------------------------------------
+// Analizza una riga AT+RANGE e restituisce la prima distanza valida in METRI.
+// Formato risposta (modalità auto-report):
+//   AT+RANGE=tid:X,mask:YY,seq:Z,range:(d0,d1,...,d7),rssi:(r0,...)
+// dove dX sono distanze in CENTIMETRI dall'anchor X. Ritorna -1.0 se la riga
+// non è un dato di ranging valido.
+// ---------------------------------------------------------------------------
+static float uwbParseRangeDistance(const String& line) {
+  if (!line.startsWith("AT+RANGE=")) return -1.0f;
+  int rIdx = line.indexOf("range:(");
+  if (rIdx < 0) return -1.0f;
+  rIdx += 7;  // salta "range:("
+  int endIdx = line.indexOf(')', rIdx);
+  if (endIdx < 0) return -1.0f;
+  String rangeStr = line.substring(rIdx, endIdx);
+  int pos = 0;
+  while (pos < (int)rangeStr.length()) {
+    int comma = rangeStr.indexOf(',', pos);
+    String token = (comma < 0) ? rangeStr.substring(pos) : rangeStr.substring(pos, comma);
+    int val = token.toInt();
+    if (val > 0) {
+      return val / 100.0f;  // cm → m
+    }
+    if (comma < 0) break;
+    pos = comma + 1;
+  }
+  return -1.0f;
+}
 
 // ---------------------------------------------------------------------------
 // Soglie

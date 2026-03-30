@@ -4,14 +4,9 @@
 #include <BLE2902.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
-#include <SPI.h>
-
-// Imposta a 1 quando la libreria arduino-DW1000 è installata:
-// https://github.com/thotro/arduino-dw1000
-#define USE_UWB 0
-#ifdef USE_UWB
-#include <DW1000Ranging.h>
-#endif
+// Nota: la comunicazione UWB avviene tramite AT commands via UART2
+// (modulo MaUWB DW3000 con STM32 – non richiede libreria DW1000/DW3000)
+// Riferimento: https://github.com/Makerfabs/MaUWB_ESP32S3-with-STM32-AT-Command
 
 #include <math.h>
 #include <cstdlib>
@@ -22,103 +17,76 @@
 CommModeManager commManager;
 
 // =============================================================================
-// GESTIONE UWB (DW1000/DW3000)
+// GESTIONE UWB (MaUWB DW3000 – comunicazione via AT command su UART2)
+// MotoA = Anchor 0 (nodo fisso di riferimento)
+// MotoB = Tag 0, MotoC = Tag 1 (nodi in movimento)
 // =============================================================================
 float currentUwbDist = -1.0f;
 unsigned long lastUwbReadingTime = 0;
 bool uwbInitialized = false;
-
-#ifdef USE_UWB
-void cbUwbNewRange() {
-  currentUwbDist    = DW1000Ranging.getDistantDevice()->getRange();
-  lastUwbReadingTime = millis();
-  Serial.printf("[UWB-SUCCESS] Ranging valido! Distanza: %.2f m | Peer MAC: %04X | RX Power: %.1f dBm\n",
-                currentUwbDist,
-                DW1000Ranging.getDistantDevice()->getShortAddress(),
-                DW1000Ranging.getDistantDevice()->getRXPower());
-}
-
-void cbUwbNewDevice(DW1000Device* device) {
-  Serial.printf("[UWB-INFO] Nuovo dispositivo UWB connesso! MAC: %04X\n", device->getShortAddress());
-}
-
-void cbUwbInactiveDevice(DW1000Device* device) {
-  Serial.printf("[UWB-WARN] Dispositivo UWB disconnesso: %04X\n", device->getShortAddress());
-  currentUwbDist = -1.0f;
-}
-#endif // USE_UWB
+String uwbLineBuffer = "";  // buffer riga AT in arrivo dal modulo
 
 void initUWB() {
-  Serial.println("\n[UWB] Avvio inizializzazione modulo...");
+  Serial.println("\n[UWB] Avvio inizializzazione modulo (AT command mode)...");
 
-  // Disabilita LoRa dal bus SPI condiviso durante init UWB
-  pinMode(LORA_CS, OUTPUT);
-  digitalWrite(LORA_CS, HIGH);
+  // Reset hardware del modulo STM32/UWB
+  pinMode(UWB_RESET, OUTPUT);
+  digitalWrite(UWB_RESET, LOW);
+  delay(50);
+  digitalWrite(UWB_RESET, HIGH);
+  delay(500);  // attendi riavvio STM32
 
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+  // Inizializza UART2 per comunicazione AT con STM32
+  uwbSerial.begin(115200, SERIAL_8N1, UWB_RXD, UWB_TXD);
+  uwbLineBuffer.reserve(128);
+  delay(100);
 
-  // Probe SPI: leggi DEV_ID del DW1000 prima di usare la libreria
-  {
-    pinMode(UWB_CS, OUTPUT);
-    digitalWrite(UWB_CS, HIGH);
-    delay(5);
-    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(UWB_CS, LOW);
-    SPI.transfer(0x00);
-    uint8_t b0 = SPI.transfer(0x00);
-    uint8_t b1 = SPI.transfer(0x00);
-    uint8_t b2 = SPI.transfer(0x00);
-    uint8_t b3 = SPI.transfer(0x00);
-    digitalWrite(UWB_CS, HIGH);
-    SPI.endTransaction();
-    uint32_t devId = ((uint32_t)b3 << 24) | ((uint32_t)b2 << 16) |
-                     ((uint32_t)b1 << 8)  |  (uint32_t)b0;
-    Serial.printf("[UWB]  DEV_ID raw = 0x%08X\n", devId);
-    bool present = ((devId >> 16) == 0xDECA) && (devId != 0xFFFFFFFF) && (devId != 0x00000000);
-    if (present) {
-      Serial.println("[UWB]  Modulo UWB rilevato via SPI! (DEV_ID valido)");
-    } else {
-      Serial.println("[UWB]  Modulo UWB NON risponde su SPI. Init saltato. Fallback: LoRa.");
-      return;
-    }
+  // Test comunicazione
+  String resp = uwbSendAT("AT?", 2000);
+  if (resp.indexOf("OK") < 0) {
+    Serial.println("[UWB]  Modulo non risponde ai comandi AT. Fallback: LoRa.");
+    return;
   }
 
-#ifdef USE_UWB
-  DW1000Ranging.initCommunication(UWB_RST, UWB_CS, UWB_IRQ);
+  // Configura ruolo e ID: MotoA = Anchor 0, MotoB = Tag 0, MotoC = Tag 1
+  int uwbIndex = 0;
+  int uwbRole  = 1;  // 1 = Anchor, 0 = Tag
+  if (String(DEVICE_ID) == "B") { uwbIndex = 0; uwbRole = 0; }
+  else if (String(DEVICE_ID) == "C") { uwbIndex = 1; uwbRole = 0; }
 
-  // MAC univoco per device per evitare collisioni
-  String macStr = "DE:AD:BE:EF:00:0";
-  macStr += String(DEVICE_ID);
-
-  DW1000Ranging.attachNewRange(cbUwbNewRange);
-  DW1000Ranging.attachNewDevice(cbUwbNewDevice);
-  DW1000Ranging.attachInactiveDevice(cbUwbInactiveDevice);
-
-  Serial.println("[UWB] Configurazione SPI e pin completata.");
-  Serial.printf("[UWB] Indirizzo MAC assegnato: %s\n", macStr.c_str());
-
-  // MotoA = Anchor (punto fisso di riferimento), B e C = Tag (nodi mobili)
-  if (String(DEVICE_ID) == "A") {
-    DW1000Ranging.startAsAnchor((char *)macStr.c_str(), DW1000.MODE_LONGDATA_RANGE_ACCURACY);
-    Serial.println("[UWB] Modulo configurato come ANCHOR (nodo fisso di riferimento).");
-    Serial.println("[UWB] In attesa dei TAG (MotoB, MotoC)...");
-  } else {
-    DW1000Ranging.startAsTag((char *)macStr.c_str(), DW1000.MODE_LONGDATA_RANGE_ACCURACY);
-    Serial.println("[UWB] Modulo configurato come TAG (nodo in movimento).");
-    Serial.println("[UWB] In ricerca dell Anchor (MotoA)...");
-  }
+  uwbSendAT("AT+RESTORE", 5000);
+  String cfgCmd = "AT+SETCFG=" + String(uwbIndex) + "," + String(uwbRole) + ",0,1";
+  uwbSendAT(cfgCmd, 2000);
+  uwbSendAT("AT+SETCAP=10,15", 2000);
+  uwbSendAT("AT+SETRPT=1", 2000);
+  uwbSendAT("AT+SAVE", 2000);
+  uwbSendAT("AT+RESTART", 3000);
 
   uwbInitialized = true;
-#else
-  Serial.println("[UWB] Modulo UWB disabilitato a compile-time (USE_UWB=0).");
-#endif // USE_UWB
+  Serial.printf("[UWB] Configurazione completata: %s (Index=%d, Ruolo=%s)\n",
+    DEVICE_ID, uwbIndex, uwbRole == 1 ? "ANCHOR" : "TAG");
 }
 
 float readUwbDistanceMeters() {
   if (!uwbInitialized) return -1.0f;
-#ifdef USE_UWB
-  DW1000Ranging.loop();
-#endif
+
+  // Leggi dati in arrivo dal modulo UWB (non bloccante)
+  while (uwbSerial.available()) {
+    char c = uwbSerial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      float dist = uwbParseRangeDistance(uwbLineBuffer);
+      uwbLineBuffer = "";
+      if (dist >= 0.0f) {
+        currentUwbDist    = dist;
+        lastUwbReadingTime = millis();
+        Serial.printf("[UWB-SUCCESS] Distanza: %.2f m\n", currentUwbDist);
+      }
+    } else {
+      uwbLineBuffer += c;
+    }
+  }
+
   if (millis() - lastUwbReadingTime > 3000 && currentUwbDist >= 0.0f) {
     Serial.println("[UWB-ERROR] Nessun dato recente dal modulo UWB (Timeout 3s). Verificare connessione.");
     currentUwbDist = -1.0f;
